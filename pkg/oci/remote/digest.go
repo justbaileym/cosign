@@ -16,6 +16,7 @@ package remote
 
 import (
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
 // ResolveDigest returns the digest of the image at the reference.
@@ -32,4 +33,13 @@ func ResolveDigest(ref name.Reference, opts ...Option) (name.Digest, error) {
 		return name.Digest{}, err
 	}
 	return ref.Context().Digest(desc.Digest.String()), nil
+}
+
+func GetDescriptor(ref name.Reference, opts ...Option) (*remote.Descriptor, error) {
+	o := makeOptions(ref.Context(), opts...)
+	desc, err := remoteGet(ref, o.ROpt...)
+	if err != nil {
+		return nil, err
+	}
+	return desc, nil
 }

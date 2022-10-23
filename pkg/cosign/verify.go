@@ -699,27 +699,55 @@ func VerifyImageAttestations(ctx context.Context, signedImgRef name.Reference, c
 		return nil, false, errors.New("one of verifier or root certs is required")
 	}
 
-	// This is a carefully optimized sequence for fetching the attestations of
-	// the entity that minimizes registry requests when supplied with a digest
-	// input.
-	digest, err := ociremote.ResolveDigest(signedImgRef, co.RegistryClientOpts...)
+	fmt.Println(signedImgRef)
+	desc, err := ociremote.GetDescriptor(signedImgRef, co.RegistryClientOpts...)
 	if err != nil {
 		return nil, false, err
 	}
-	h, err := v1.NewHash(digest.Identifier())
-	if err != nil {
-		return nil, false, err
+	signedImgRefs := make([]name.Reference, 0)
+	if desc.MediaType.IsIndex() {
+		index, err := desc.ImageIndex()
+		if err != nil {
+			return nil, false, err
+		}
+		manifest, err := index.IndexManifest()
+		if err != nil {
+			return nil, false, err
+		}
+		for _, manifest := range manifest.Manifests {
+			signedImgRefs = append(signedImgRefs, signedImgRef.Context().Digest(manifest.Digest.String()))
+		}
+	} else {
+		// This is a carefully optimized sequence for fetching the attestations ofl
+		// the entity that minimizes registry requests when supplied with a digest
+		// input.
+		digest, err := ociremote.ResolveDigest(signedImgRef, co.RegistryClientOpts...)
+		if err != nil {
+			return nil, false, err
+		}
+		signedImgRefs = append(signedImgRefs, digest)
 	}
-	st, err := ociremote.AttestationTag(digest, co.RegistryClientOpts...)
-	if err != nil {
-		return nil, false, err
-	}
-	atts, err := ociremote.Signatures(st, co.RegistryClientOpts...)
-	if err != nil {
-		return nil, false, err
+	attss := make([]oci.Signatures, 0)
+	hs := make([]v1.Hash, 0)
+	for _, digest := range signedImgRefs {
+		h, err := v1.NewHash(digest.Identifier())
+		if err != nil {
+			return nil, false, err
+		}
+		hs = append(hs, h)
+
+		st, err := ociremote.AttestationTag(digest, co.RegistryClientOpts...)
+		if err != nil {
+			return nil, false, err
+		}
+		newAtts, err := ociremote.Signatures(st, co.RegistryClientOpts...)
+		if err != nil {
+			return nil, false, err
+		}
+		attss = append(attss, newAtts)
 	}
 
-	return verifyImageAttestations(ctx, atts, h, co)
+	return verifyImageAttestations(ctx, attss, hs, co)
 }
 
 // VerifyLocalImageAttestations verifies attestations from a saved, local image, without any network calls,
@@ -761,95 +789,98 @@ func VerifyLocalImageAttestations(ctx context.Context, path string, co *CheckOpt
 		return nil, false, errors.New("must verify either an image index or image")
 	}
 
+	// TODO: Make this work too
 	atts, err := se.Attestations()
 	if err != nil {
 		return nil, false, err
 	}
-	return verifyImageAttestations(ctx, atts, h, co)
+	return verifyImageAttestations(ctx, []oci.Signatures{atts}, []v1.Hash{h}, co)
 }
 
-func verifyImageAttestations(ctx context.Context, atts oci.Signatures, h v1.Hash, co *CheckOpts) (checkedAttestations []oci.Signature, bundleVerified bool, err error) {
-	sl, err := atts.Get()
-	if err != nil {
-		return nil, false, err
-	}
-
+func verifyImageAttestations(ctx context.Context, attss []oci.Signatures, hs []v1.Hash, co *CheckOpts) (checkedAttestations []oci.Signature, bundleVerified bool, err error) {
 	validationErrs := []string{}
-	for _, att := range sl {
-		att, err := static.Copy(att)
+	for i, h := range hs {
+		atts := attss[i]
+		sl, err := atts.Get()
 		if err != nil {
-			validationErrs = append(validationErrs, err.Error())
-			continue
+			return nil, false, err
 		}
-		if err := func(att oci.Signature) error {
-			verifier := co.SigVerifier
-			if verifier == nil {
-				// If we don't have a public key to check against, we can try a root cert.
-				cert, err := att.Cert()
-				if err != nil {
-					return err
-				}
-				if cert == nil {
-					return &VerificationError{"no certificate found on attestation"}
-				}
-				// Create a certificate pool for intermediate CA certificates, excluding the root
-				chain, err := att.Chain()
-				if err != nil {
-					return err
-				}
-				// If the chain annotation is not present or there is only a root
-				if chain == nil || len(chain) <= 1 {
-					co.IntermediateCerts = nil
-				} else if co.IntermediateCerts == nil {
-					// If the intermediate certs have not been loaded in by TUF
-					pool := x509.NewCertPool()
-					for _, cert := range chain[:len(chain)-1] {
-						pool.AddCert(cert)
-					}
-					co.IntermediateCerts = pool
-				}
-				verifier, err = ValidateAndUnpackCert(cert, co)
-				if err != nil {
-					return err
-				}
+		for _, att := range sl {
+			att, err := static.Copy(att)
+			if err != nil {
+				validationErrs = append(validationErrs, err.Error())
+				continue
 			}
-
-			if err := verifyOCIAttestation(ctx, verifier, att); err != nil {
-				return err
-			}
-
-			// We can't check annotations without claims, both require unmarshalling the payload.
-			if co.ClaimVerifier != nil {
-				if err := co.ClaimVerifier(att, h, co.Annotations); err != nil {
-					return err
-				}
-			}
-
-			verified, err := VerifyBundle(ctx, att, co.RekorClient)
-			if err != nil && co.RekorClient == nil {
-				return fmt.Errorf("unable to verify bundle: %w", err)
-			}
-			bundleVerified = bundleVerified || verified
-
-			if !verified && co.RekorClient != nil {
-				if co.SigVerifier != nil {
-					pub, err := co.SigVerifier.PublicKey(co.PKOpts...)
+			if err := func(att oci.Signature) error {
+				verifier := co.SigVerifier
+				if verifier == nil {
+					// If we don't have a public key to check against, we can try a root cert.
+					cert, err := att.Cert()
 					if err != nil {
 						return err
 					}
-					return tlogValidatePublicKey(ctx, co.RekorClient, pub, att)
+					if cert == nil {
+						return &VerificationError{"no certificate found on attestation"}
+					}
+					// Create a certificate pool for intermediate CA certificates, excluding the root
+					chain, err := att.Chain()
+					if err != nil {
+						return err
+					}
+					// If the chain annotation is not present or there is only a root
+					if chain == nil || len(chain) <= 1 {
+						co.IntermediateCerts = nil
+					} else if co.IntermediateCerts == nil {
+						// If the intermediate certs have not been loaded in by TUF
+						pool := x509.NewCertPool()
+						for _, cert := range chain[:len(chain)-1] {
+							pool.AddCert(cert)
+						}
+						co.IntermediateCerts = pool
+					}
+					verifier, err = ValidateAndUnpackCert(cert, co)
+					if err != nil {
+						return err
+					}
 				}
 
-				return tlogValidateCertificate(ctx, co.RekorClient, att)
-			}
-			return nil
-		}(att); err != nil {
-			validationErrs = append(validationErrs, err.Error())
-			continue
-		}
+				if err := verifyOCIAttestation(ctx, verifier, att); err != nil {
+					return err
+				}
 
-		// Phew, we made it.
-		checkedAttestations = append(checkedAttestations, att)
+				// We can't check annotations without claims, both require unmarshalling the payload.
+				if co.ClaimVerifier != nil {
+					if err := co.ClaimVerifier(att, h, co.Annotations); err != nil {
+						return err
+					}
+				}
+
+				verified, err := VerifyBundle(ctx, att, co.RekorClient)
+				if err != nil && co.RekorClient == nil {
+					return fmt.Errorf("unable to verify bundle: %w", err)
+				}
+				bundleVerified = bundleVerified || verified
+
+				if !verified && co.RekorClient != nil {
+					if co.SigVerifier != nil {
+						pub, err := co.SigVerifier.PublicKey(co.PKOpts...)
+						if err != nil {
+							return err
+						}
+						return tlogValidatePublicKey(ctx, co.RekorClient, pub, att)
+					}
+
+					return tlogValidateCertificate(ctx, co.RekorClient, att)
+				}
+				return nil
+			}(att); err != nil {
+				validationErrs = append(validationErrs, err.Error())
+				continue
+			}
+
+			// Phew, we made it.
+			checkedAttestations = append(checkedAttestations, att)
+		}
 	}
 	if len(checkedAttestations) == 0 {
 		return nil, false, fmt.Errorf("%w:\n%s", ErrNoMatchingAttestations, strings.Join(validationErrs, "\n "))
